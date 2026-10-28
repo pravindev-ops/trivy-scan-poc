@@ -1,0 +1,116 @@
+name: "Trivy Code & Container Pipeline"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  IMAGE_NAME: "sample-app"
+
+jobs:
+  # =========================================================================
+  # STAGE 1: Code & Dependency (SCA) + Secret Scanning (Shift-Left)
+  # =========================================================================
+  code-security-scan:
+    name: "1. Code, SCA & Secrets Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Checkout Source Code"
+        uses: actions/checkout@v4
+
+      # Scans filesystem for open source dependency vulnerabilities & hardcoded credentials
+      - name: "Trivy Filesystem Scan (SARIF)"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: "Upload Code Scan SARIF to Security Tab"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: 'code-and-secrets'
+        continue-on-error: true
+
+      # Fail the build early if secrets or critical dependency CVEs exist
+      - name: "PR Gate: Block on Code Flaws"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+  # =========================================================================
+  # STAGE 2: Build & Scan Container Image (Post-Build / Pre-Push)
+  # =========================================================================
+  image-security-scan:
+    name: "2. Build & Container Image Scan"
+    runs-on: ubuntu-latest
+    needs: [code-security-scan] # ONLY runs if Stage 1 passes
+
+    steps:
+      - name: "Checkout Source Code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      # Build the image locally on the runner (Do NOT push to registry yet)
+      - name: "Build Local Docker Image"
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true # Loads image into local docker daemon for scanning
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # Scan the newly built local image
+      - name: "Trivy Container Image Scan (SARIF)"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: "Upload Container Scan SARIF to Security Tab"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+          category: 'container-image'
+        continue-on-error: true
+
+      # Block pipeline if container OS layers contain CRITICAL flaws
+      - name: "PR Gate: Block on Container Flaws"
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL'
+
+      # =====================================================================
+      # STAGE 3: Production Push (Only executes if all scans pass)
+      # =====================================================================
+      - name: "Deploy / Push to Registry (Simulated)"
+        if: success()
+        run: |
+          echo "Image passed all security gates! Ready to push to Artifact Registry / ECR."
+          # docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
